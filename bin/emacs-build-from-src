@@ -247,6 +247,25 @@ def build_environment():
     env_build["PKG_CONFIG_PATH"] = f"{path_brew / 'lib/pkgconfig'}:{path_brew / 'share/pkgconfig'}:{env_build.get('PKG_CONFIG_PATH', '')}"
     return env_build
 
+# --- MACOS LEGACY APPLICATIONS CLEANUP & NEXTSTEP MERGE ---
+def macos_ensure_clean_applications():
+    log_section("Cleaning up /Applications Emacs Bundles")
+    for app_path in [Path("/Applications/Emacs.app"), Path.home() / "Applications/Emacs.app"]:
+        if app_path.exists():
+            log_info(f"Removing application bundle from {app_path}")
+            shutil.rmtree(app_path, ignore_errors=True)
+    log_ok("Applications folder check complete.")
+
+def macos_merge_nextstep(source_worktree):
+    log_section("Merging Nextstep into Prefix Layout (/usr/local)")
+    nextstep_dir = source_worktree / "nextstep"
+    if not nextstep_dir.exists():
+        log_warn(f"Nextstep directory not found at {nextstep_dir}")
+        return
+    # Use macOS 'ditto' to cleanly merge directory trees and handle extended attributes
+    system_cmd_run("sudo", "ditto", str(nextstep_dir), str(PATH_PREFIX))
+    log_ok("Successfully merged nextstep/** into /usr/local/**")
+
 # --- CUSTOM ICON & SERVICE INSTALLERS ---
 def custom_icon_install(source_worktree):
     log_info("Checking for custom icon installation...")
@@ -272,6 +291,41 @@ def custom_icon_install(source_worktree):
     else:
         system_cmd_run("sudo", "install", "-m", "644", str(PATH_CUSTOM_ICON), str(path_icon_target))
     log_ok(f"Custom icon resource installed at {path_icon_target}")
+
+def convert_png_to_icns(png_path, icns_output_path):
+    if not png_path.exists():
+        return False
+    if shutil.which("iconutil") and (shutil.which("magick") or shutil.which("sips")):
+        temp_dir = Path(tempfile.mkdtemp())
+        try:
+            iconset_dir = temp_dir / "icon.iconset"
+            iconset_dir.mkdir()
+
+            sizes = [16, 32, 64, 128, 256, 512]
+            for s in sizes:
+                # 1x size
+                out_file = iconset_dir / f"icon_{s}x{s}.png"
+                if shutil.which("magick"):
+                    subprocess.run(["magick", str(png_path), "-resize", f"{s}x{s}", str(out_file)], check=False)
+                else:
+                    subprocess.run(["sips", "-z", str(s), str(s), str(png_path), "--out", str(out_file)], stdout=subprocess.DEVNULL, check=False)
+
+                # 2x size (Retina)
+                s2 = s * 2
+                if s2 <= 1024:
+                    out_file_2x = iconset_dir / f"icon_{s}x{s}@2x.png"
+                    if shutil.which("magick"):
+                        subprocess.run(["magick", str(png_path), "-resize", f"{s2}x{s2}", str(out_file_2x)], check=False)
+                    else:
+                        subprocess.run(["sips", "-z", str(s2), str(s2), str(png_path), "--out", str(out_file_2x)], stdout=subprocess.DEVNULL, check=False)
+
+            res = subprocess.run(["iconutil", "-c", "icns", str(iconset_dir), "-o", str(icns_output_path)], check=False)
+            return res.returncode == 0
+        except Exception:
+            return False
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+    return False
 
 def service_daemon_install_macos():
     log_section("Configuring Launchd Auto-start Service")
@@ -309,35 +363,115 @@ def service_daemon_enable_linux():
         log_warn(f"Systemd service file not found at {installed_service}. Skipping service enable.")
         return
 
-    # 1. Kill any standalone non-systemd Emacs server instances
     subprocess.run(["killall", "emacs"], stderr=subprocess.DEVNULL)
 
-    # 2. Clear stale socket files from /run/user/<uid>/emacs/ and /tmp/
     uid = os.getuid()
     for socket_dir in [f"/run/user/{uid}/emacs", f"/tmp/emacs{uid}"]:
         if os.path.exists(socket_dir):
             shutil.rmtree(socket_dir, ignore_errors=True)
 
-    # 3. Setup systemd service file
     PATH_SYSTEMD_SERVICE.parent.mkdir(parents=True, exist_ok=True)
-
-    # Remove existing symlink or file if present
     if PATH_SYSTEMD_SERVICE.is_symlink() or PATH_SYSTEMD_SERVICE.exists():
         PATH_SYSTEMD_SERVICE.unlink()
 
-    # COPY the unit file instead of symlinking to satisfy systemd restrictions
     shutil.copy(installed_service, PATH_SYSTEMD_SERVICE)
     log_ok(f"Copied {installed_service} -> {PATH_SYSTEMD_SERVICE}")
 
-    # 4. Reload and start cleanly
     system_cmd_run("systemctl", "--user", "daemon-reload")
     system_cmd_run("systemctl", "--user", "enable", "--now", "emacs.service")
     log_ok("Emacs server auto-run service enabled and started via systemd!")
 
+# --- WRAPPER & DESKTOP SHORTCUT AUTOMATION ---
+def setup_user_wrappers_and_launchers(source_worktree):
+    log_section("Setting up System Wrappers & Desktop Launchers")
+    system_bin_dir = PATH_PREFIX / "bin"
+    desktop_dir = Path.home() / "Desktop"
+
+    system_bin_dir.mkdir(parents=True, exist_ok=True)
+    desktop_dir.mkdir(parents=True, exist_ok=True)
+
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        script_emacs = tmp_dir / "run-emacs"
+        script_emacs.write_text("#!/bin/bash\nemacs \"$@\"\n")
+
+        script_emacs_nw = tmp_dir / "run-emacs-nw"
+        script_emacs_nw.write_text("#!/bin/bash\nemacs -nw \"$@\"\n")
+
+        script_emacsclient_ca = tmp_dir / "run-emacsclient-ca"
+        script_emacsclient_ca.write_text(
+            "#!/bin/bash\n"
+            "emacsclient -c -a='' \"$@\" &\n"
+            "osascript -e 'tell application \"Terminal\" to set visible of front window to false' 2>/dev/null &\n"
+            "exit 0\n"
+        )
+
+        script_emacsclient_ta = tmp_dir / "run-emacsclient-ta"
+        script_emacsclient_ta.write_text("#!/bin/bash\nemacsclient -t -a='' \"$@\"\n")
+
+        for s in (script_emacs, script_emacs_nw, script_emacsclient_ca, script_emacsclient_ta):
+            s.chmod(0o755)
+            system_cmd_run("sudo", "install", "-m", "755", str(s), str(system_bin_dir / s.name))
+        log_ok(f"Installed system script wrappers into {system_bin_dir}")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    if sys.platform == "darwin":
+        emacs = desktop_dir / "Emacs.app"
+        emacs_nw = desktop_dir / "Emacs-nw.app"
+        emacsclient_ca = desktop_dir / "EmacsClient-ca.app"
+        emacsclient_ta = desktop_dir / "EmacsClient-ta.app"
+
+        for app in (emacs, emacs_nw, emacsclient_ca, emacsclient_ta):
+            if app.exists(): shutil.rmtree(app)
+
+        system_cmd_run("osacompile", "-e", f'tell application "Terminal" to do script "{system_bin_dir}/run-emacs"', "-o", str(emacs))
+        system_cmd_run("osacompile", "-e", f'tell application "Terminal" to do script "{system_bin_dir}/run-emacs-nw"', "-o", str(emacs_nw))
+        system_cmd_run("osacompile", "-e", f'tell application "Terminal" to do script "{system_bin_dir}/run-emacsclient-ca"', "-o", str(emacsclient_ca))
+        system_cmd_run("osacompile", "-e", f'tell application "Terminal" to do script "{system_bin_dir}/run-emacsclient-ta"', "-o", str(emacsclient_ta))
+
+        # Icon application priority: Custom icon first, fallback to default source Emacs.icns
+        icns_temp = Path(tempfile.mktemp(suffix=".icns"))
+        icon_applied = False
+
+        if PATH_CUSTOM_ICON.exists():
+            log_info(f"Converting custom icon ({PATH_CUSTOM_ICON}) for desktop bundles...")
+            if convert_png_to_icns(PATH_CUSTOM_ICON, icns_temp):
+                icon_source_to_use = icns_temp
+                icon_applied = True
+
+        if not icon_applied:
+            default_icns = source_worktree / "nextstep/nextstep/Emacs.app/Contents/Resources/Emacs.icns"
+            if default_icns.exists():
+                icon_source_to_use = default_icns
+                icon_applied = True
+
+        if icon_applied:
+            for app in (emacs, emacs_nw, emacsclient_ca, emacsclient_ta):
+                target_icns = app / "Contents/Resources/applet.icns"
+                target_icns.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy(icon_source_to_use, target_icns)
+            log_ok("Successfully applied custom icon to desktop .app bundles.")
+
+            # Force macOS Finder cache to refresh the new icon graphics
+            for app in (emacs, emacs_nw, emacsclient_ca, emacsclient_ta):
+                subprocess.run(["touch", str(app)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        else:
+            log_warn("Could not assign an icon to desktop .app bundles.")
+
+        if icns_temp.exists():
+            icns_temp.unlink(missing_ok=True)
+
+        log_ok("Successfully generated native desktop `.app` shortcut bundles on macOS Desktop.")
+    else:
+        log_info("Linux environment detected: Desktop .app bundle creation skipped.")
+
 # --- BUILD PROCEDURES ---
 def emacs_build_from_source(source_worktree, channel_name):
     log_section(f"Compiling Emacs Source (Channel: {channel_name})")
-    if sys.platform == "darwin": deps_install_macos()
+    if sys.platform == "darwin":
+        deps_install_macos()
+        macos_ensure_clean_applications()
 
     previous_channel = PATH_FILE_BUILD_CHANNEL.read_text().strip() if PATH_FILE_BUILD_CHANNEL.exists() else None
     if previous_channel and previous_channel != channel_name:
@@ -367,19 +501,18 @@ def emacs_build_from_source(source_worktree, channel_name):
     system_cmd_run("sudo", "make", "install", cwd=PATH_WORKTREE_BUILD, env=env_build)
 
     if sys.platform == "darwin":
-        macos_install_native_executables()
-        macos_remove_application_bundle()
+        macos_merge_nextstep(source_worktree)
         service_daemon_install_macos()
         verify_macos()
-        log_ok(f"Successfully installed standalone GUI Emacs binary to {PATH_PREFIX / 'bin/emacs'}")
     else:
-        custom_icon_install(source_worktree)
         service_daemon_enable_linux()
         verify_linux()
-        log_ok(f"Successfully installed Emacs to {PATH_PREFIX}")
+
+    custom_icon_install(source_worktree)
+    setup_user_wrappers_and_launchers(source_worktree)
 
 def configure_macos(path_configure, env_build):
-    log_info(f"Running configure script for macOS (Native NS GUI, Unix Prefix: {PATH_PREFIX})...")
+    log_info(f"Running configure script for macOS (Raw binary layout via --disable-ns-self-contained, Prefix: {PATH_PREFIX})...")
     path_brew, path_gcc_root, path_jit_root = brew_prefix_path(), brew_package_prefix("gcc"), brew_package_prefix("libgccjit")
     support_lib_dir, gcc_lib_dir = brew_gcc_support_lib_path(), brew_gcc_lib_dir_path()
 
@@ -405,46 +538,6 @@ def configure_linux(path_configure, env_build):
     ]
     system_cmd_run(*configure_args, cwd=PATH_WORKTREE_BUILD, env=env_build)
 
-# --- MACOS EXECUTABLE MANAGEMENT ---
-def macos_nextstep_app_path(): return PATH_WORKTREE_BUILD / "nextstep" / "Emacs.app"
-def macos_nextstep_emacs_path(): return macos_nextstep_app_path() / "Contents" / "MacOS" / "Emacs"
-
-def macos_nextstep_emacsclient_path():
-    for candidate in [
-        macos_nextstep_app_path() / "Contents/MacOS/bin/emacsclient",
-        macos_nextstep_app_path() / "Contents/MacOS/emacsclient"
-    ]:
-        if candidate.exists(): return candidate
-    return None
-
-def macos_install_native_executables():
-    log_section("Installing Native macOS GUI Executables")
-    path_emacs, path_prefix_bin = macos_nextstep_emacs_path(), PATH_PREFIX / "bin"
-    if not path_emacs.exists(): system_die(f"Native macOS Emacs executable not found: {path_emacs}")
-
-    system_cmd_run("sudo", "mkdir", "-p", str(path_prefix_bin))
-    system_cmd_run("sudo", "install", "-m", "755", str(path_emacs), str(path_prefix_bin / "emacs"))
-
-    path_emacsclient = macos_nextstep_emacsclient_path()
-    if path_emacsclient is not None:
-        system_cmd_run("sudo", "install", "-m", "755", str(path_emacsclient), str(path_prefix_bin / "emacsclient"))
-        log_ok(f"Installed emacsclient to {path_prefix_bin / 'emacsclient'}")
-    elif not (path_prefix_bin / "emacsclient").exists():
-        system_die("emacsclient was not found in Nextstep output or installed Unix prefix.")
-
-    log_ok(f"Installed native GUI Emacs executable to {path_prefix_bin / 'emacs'}")
-
-def macos_remove_application_bundle():
-    log_section("Removing macOS Application Bundle")
-    path_app = macos_nextstep_app_path()
-    if not path_app.exists():
-        log_ok("No Emacs.app bundle remains")
-        return
-    log_info(f"Removing temporary build bundle: {path_app}")
-    shutil.rmtree(path_app)
-    if path_app.exists(): system_die(f"Failed to remove application bundle: {path_app}")
-    log_ok("Temporary Emacs.app removed")
-
 # --- VERIFICATION ---
 def verify_macos():
     log_section("Verifying macOS Installation")
@@ -460,7 +553,6 @@ def verify_macos():
     )
     system_cmd_run(str(path_client_bin), "--version")
 
-    if macos_nextstep_app_path().exists(): system_die("Emacs.app still exists in build tree")
     log_ok(f"GUI binary installed: {path_emacs_bin}")
     if PATH_LAUNCHD_PLIST.exists(): log_ok("Daemon Background Service: com.gnu.emacs.daemon (via launchd)")
     else: log_warn("Launchd daemon plist not detected.")
