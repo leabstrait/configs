@@ -63,6 +63,7 @@ merge-test = !git merge --no-commit --no-ff "$@" || echo "Run \\'git merge --abo
 [fetch]
 	verifySignatures = true
 	force = true
+	pruneTags = true
 [checkout]
 	workers = 4
 [advice]

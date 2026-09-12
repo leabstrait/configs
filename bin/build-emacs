@@ -1,0 +1,763 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+###############################################################################
+# Configuration
+###############################################################################
+
+WORKTREE="${WORKTREE:-master}"
+SRC_DIR="${SRC_DIR:-$HOME/ws/i/emacs/worktrees/$WORKTREE}"
+BUILD_DIR="${BUILD_DIR:-$HOME/ws/i/emacs/builds/$WORKTREE}"
+
+CLEAN_BUILD=false
+UNINSTALL=false
+STATUS=false
+
+WORKTREE_OPTION_SET=false
+
+###############################################################################
+# Helpers
+###############################################################################
+
+log() {
+    printf '\n==> %s\n' "$*"
+}
+
+error() {
+    printf 'Error: %s\n' "$*" >&2
+    exit 1
+}
+
+warn() {
+    printf 'Warning: %s\n' "$*" >&2
+}
+
+require_command() {
+    command -v "$1" >/dev/null 2>&1 ||
+        error "Required command not found: $1"
+}
+
+usage() {
+    cat <<EOF
+Usage: $0 [OPTIONS]
+
+Build and install Emacs from:
+  $SRC_DIR
+
+Options:
+  --stable           Use the 'stable' worktree and build directory
+  --master           Use the 'master' worktree and build directory (default)
+  --worktree NAME    Use a custom worktree name and path dynamically
+  -c, --clean        Clean the existing build before configuring
+  -u, --uninstall    Remove the installed Emacs integration
+  -s, --status       Show daemon/service status
+  -h, --help         Show this help
+
+Environment:
+  SRC_DIR            Override the Emacs source directory
+  BUILD_DIR          Override the Emacs build directory
+  WORKTREE           Select worktree name
+EOF
+}
+
+cleanup_on_error() {
+    local exit_code=$?
+    if (( exit_code != 0 )); then
+        printf '\n❌ Build failed with exit code %d.\n' "$exit_code" >&2
+    fi
+}
+
+trap cleanup_on_error EXIT
+
+###############################################################################
+# Package lists
+###############################################################################
+
+brew_build_dependencies=(
+    make
+    autoconf
+    gnu-sed
+    gnu-tar
+    grep
+    coreutils
+    pkg-config
+    texinfo
+    xz
+    m4
+    sqlite
+    gnutls
+    librsvg
+    little-cms2
+    tree-sitter
+    webp
+    mailutils
+    libgccjit # for JIT
+    gcc      # for JIT
+    gmp
+    libjpeg
+    zlib
+    texlive
+)
+
+arch_build_dependencies=(
+    texinfo
+    gnutls
+    librsvg
+    libxml2
+    libwebp
+    lcms2
+    tree-sitter
+    libgccjit
+    texlive
+    pkgconf
+    jansson
+    imagemagick
+    cairo
+    harfbuzz
+    sqlite
+    alsa-lib
+)
+
+###############################################################################
+# Argument parsing
+###############################################################################
+
+while (($# > 0)); do
+    case "$1" in
+        --stable)
+            [[ "$WORKTREE_OPTION_SET" == false ]] ||
+                error "--stable, --master, and --worktree cannot be used together"
+
+            WORKTREE_OPTION_SET=true
+            WORKTREE="stable"
+            SRC_DIR="$HOME/ws/i/emacs/worktrees/stable"
+            BUILD_DIR="$HOME/ws/i/emacs/builds/stable"
+            ;;
+        --master)
+            [[ "$WORKTREE_OPTION_SET" == false ]] ||
+                error "--stable, --master, and --worktree cannot be used together"
+
+            WORKTREE_OPTION_SET=true
+            WORKTREE="master"
+            SRC_DIR="$HOME/ws/i/emacs/worktrees/master"
+            BUILD_DIR="$HOME/ws/i/emacs/builds/master"
+            ;;
+        --worktree)
+            [[ "$WORKTREE_OPTION_SET" == false ]] ||
+                error "--stable, --master, and --worktree cannot be used together"
+
+            shift
+            (($# > 0)) || error "--worktree requires a name argument"
+
+            WORKTREE_OPTION_SET=true
+            WORKTREE="$1"
+            SRC_DIR="$HOME/ws/i/emacs/worktrees/$WORKTREE"
+            BUILD_DIR="$HOME/ws/i/emacs/builds/$WORKTREE"
+            ;;
+        -c|--clean)
+            CLEAN_BUILD=true
+            ;;
+        -u|--uninstall)
+            UNINSTALL=true
+            ;;
+        -s|--status)
+            STATUS=true
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Unknown parameter: $1" >&2
+            usage
+            exit 1
+            ;;
+    esac
+    shift
+done
+
+if [[ "$UNINSTALL" == true && "$STATUS" == true ]]; then
+    error "--uninstall and --status cannot be used together"
+fi
+
+###############################################################################
+# OS detection
+###############################################################################
+
+OS="$(uname -s)"
+
+case "$OS" in
+    Darwin)
+        PLATFORM="macOS"
+        ;;
+    Linux)
+        PLATFORM="Linux"
+        ;;
+    *)
+        error "Unsupported operating system: $OS"
+        ;;
+esac
+
+###############################################################################
+# macOS
+###############################################################################
+
+install_macos() {
+    log "Checking Emacs source tree ($WORKTREE)"
+
+    [[ -d "$SRC_DIR" ]] ||
+        error "Emacs source directory not found: $SRC_DIR"
+
+    [[ -f "$SRC_DIR"/configure.ac ]] ||
+        error "$SRC_DIR does not appear to be an Emacs source tree"
+
+    log "Installing macOS build dependencies"
+
+    brew install "${brew_build_dependencies[@]}"
+
+    log "Preparing build"
+
+    if [[ "$CLEAN_BUILD" == true ]]; then
+        if [[ -f "$BUILD_DIR/Makefile" ]]; then
+            log "Performing clean build (make distclean)"
+            make -C "$BUILD_DIR" distclean || true
+        else
+            log "No existing Makefile; skipping distclean"
+        fi
+        rm -rf "$BUILD_DIR"
+    fi
+
+    config_args=(
+        --disable-dependency-tracking
+        --disable-silent-rules
+        --enable-locallisppath=#{HOMEBREW_PREFIX}/share/emacs/site-lisp
+        --infodir=#{info}/emacs
+        --prefix=#{prefix}
+        --with-native-compilation=aot
+        --with-xml2
+        --with-gnutls
+        --without-compress-install
+    )
+
+    # Set flags so Emacs can find Homebrew dependencies on M-series chips
+    CFLAGS="-I/opt/homebrew/include -O3 -march=native" \
+    LDFLAGS="-L/opt/homebrew/lib" \
+    LIBRARY_PATH="/opt/homebrew/lib/gcc/current" \
+
+    cd "$SRC_DIR"
+    ./autogen.sh
+
+    mkdir -p "$BUILD_DIR"
+    cd "$BUILD_DIR"
+
+    "$SRC_DIR"/configure \
+        --with-ns \
+        --with-native-compilation=aot \
+        --with-tree-sitter \
+        --with-modules \
+        --with-xwidgets
+
+
+
+    # Build utilizing all CPU cores
+    make -j$(sysctl -n hw.ncpu)
+    make install
+
+exit
+    local app
+    app="$BUILD_DIR/nextstep/Emacs.app"
+
+    [[ -d "$app" ]] ||
+        error "Built Emacs.app not found: $app"
+
+    log "Installing Emacs"
+
+    make install
+
+    [[ -x "/usr/local/bin/emacs" ]] ||
+        error "Emacs installation failed: /usr/local/bin/emacs not found"
+
+    [[ -x "/usr/local/bin/emacsclient" ]] ||
+        error "Emacs installation failed: /usr/local/bin/emacsclient not found"
+
+    if [[ ":$PATH:" != *"/usr/local/bin:"* ]]; then
+        warn "/usr/local/bin is not currently in PATH"
+    fi
+
+    log "Linking Emacs.app into /Applications"
+
+    if [[ -e /Applications/Emacs.app && ! -L /Applications/Emacs.app ]]; then
+        error "/Applications/Emacs.app exists and is not a symlink; refusing to remove it"
+    fi
+
+    if [[ -L /Applications/Emacs.app ]]; then
+        local current_target
+        current_target="$(readlink /Applications/Emacs.app)"
+
+        if [[ "$current_target" != "$app" ]]; then
+            log "Updating existing Emacs.app symlink"
+            sudo rm /Applications/Emacs.app
+            sudo ln -s "$app" /Applications/Emacs.app
+        else
+            log "Emacs.app symlink already points to current build"
+        fi
+    else
+        sudo ln -s "$app" /Applications/Emacs.app
+    fi
+
+    log "Configuring launchd daemon"
+
+    local plist_dir="$HOME/Library/LaunchAgents"
+    local plist_file="$plist_dir/org.gnu.Emacs.plist"
+    local uid
+
+    uid="$(id -u)"
+
+    mkdir -p "$plist_dir"
+
+    cat > "$plist_file" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+"http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>org.gnu.Emacs</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Applications/Emacs.app/Contents/MacOS/Emacs</string>
+        <string>--fg-daemon</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+</dict>
+</plist>
+EOF
+
+    log "Reloading launchd service"
+
+    launchctl bootout "gui/$uid" "$plist_file" 2>/dev/null || true
+    launchctl bootstrap "gui/$uid" "$plist_file"
+
+    log "Verifying launchd service"
+
+    launchctl print "gui/$uid/org.gnu.Emacs" >/dev/null ||
+        error "Emacs launchd service failed to start"
+
+    echo
+    echo "--------------------------------------------------"
+    echo "✅ macOS Emacs build complete ($WORKTREE)"
+    echo "   Cocoa + Native Compilation + Tree-Sitter + LTO"
+    echo "   Build:        $BUILD_DIR"
+    echo "   Application:  /Applications/Emacs.app"
+    echo "   App target:   $app"
+    echo "   Daemon:       org.gnu.Emacs"
+    echo "--------------------------------------------------"
+}
+
+uninstall_macos() {
+    require_command launchctl
+
+    local plist_file="$HOME/Library/LaunchAgents/org.gnu.Emacs.plist"
+    local uid
+
+    uid="$(id -u)"
+
+    log "Stopping launchd daemon"
+
+    if [[ -f "$plist_file" ]]; then
+        launchctl bootout "gui/$uid" "$plist_file" 2>/dev/null || true
+        rm -f "$plist_file"
+    fi
+
+    if [[ -L /Applications/Emacs.app ]]; then
+        local target
+        target="$(readlink /Applications/Emacs.app)"
+
+        log "Removing /Applications/Emacs.app symlink"
+        sudo rm /Applications/Emacs.app
+
+        echo "Removed symlink:"
+        echo "  /Applications/Emacs.app -> $target"
+    elif [[ -e /Applications/Emacs.app ]]; then
+        warn "/Applications/Emacs.app exists and is not a symlink; leaving it untouched"
+    fi
+
+    if [[ -x "/usr/local/bin/emacs" ]]; then
+        log "Removing /usr/local/bin/emacs installation"
+
+        sudo rm -f \
+            /usr/local/bin/emacs \
+            /usr/local/bin/emacsclient
+    fi
+
+    echo "✅ macOS Emacs daemon/service integration removed."
+}
+
+uninstall_macos_brew_dependencies() {
+    require_command brew
+
+    local installed=()
+    local package
+
+    for package in "${brew_build_dependencies[@]}"; do
+        if brew list --formula "$package" >/dev/null 2>&1; then
+            installed+=("$package")
+        fi
+    done
+
+    if (( ${#installed[@]} == 0 )); then
+        log "No target Homebrew dependencies are installed."
+        return
+    fi
+
+    local leaves=()
+    local formula
+
+    while IFS= read -r formula; do
+        [[ -n "$formula" ]] || continue
+
+        for package in "${installed[@]}"; do
+            if [[ "$formula" == "$package" ]]; then
+                leaves+=("$formula")
+                break
+            fi
+        done
+    done < <(brew leaves)
+
+    if (( ${#leaves[@]} == 0 )); then
+        log "No unused Homebrew build dependencies found."
+        return
+    fi
+
+    log "Found unused Homebrew build dependencies: ${leaves[*]}"
+
+    read -r -p \
+        "Do you want to uninstall these unused dependencies? [y/N] " \
+        response
+
+    if [[ "$response" =~ ^([yY][eE][sS]|[yY])$ ]]; then
+        brew uninstall "${leaves[@]}"
+    else
+        log "Leaving unused Homebrew dependencies installed."
+    fi
+}
+
+status_macos() {
+    require_command launchctl
+
+    local uid
+    uid="$(id -u)"
+
+    if launchctl print "gui/$uid/org.gnu.Emacs" >/dev/null 2>&1; then
+        echo "✅ Emacs daemon is running."
+        launchctl print "gui/$uid/org.gnu.Emacs"
+    else
+        echo "❌ Emacs daemon is not running."
+    fi
+
+    echo
+
+    if [[ -L /Applications/Emacs.app ]]; then
+        echo "Application symlink:"
+        echo "  /Applications/Emacs.app -> $(readlink /Applications/Emacs.app)"
+    elif [[ -e /Applications/Emacs.app ]]; then
+        echo "⚠️  /Applications/Emacs.app exists but is not a symlink."
+    else
+        echo "❌ /Applications/Emacs.app symlink does not exist."
+    fi
+
+    echo
+
+    if [[ -x "/usr/local/bin/emacs" ]]; then
+        echo "✅ /usr/local/bin/emacs is installed."
+    else
+        echo "❌ /usr/local/bin/emacs is not installed."
+    fi
+
+    if [[ -x "/usr/local/bin/emacsclient" ]]; then
+        echo "✅ /usr/local/bin/emacsclient is installed."
+    else
+        echo "❌ /usr/local/bin/emacsclient is not installed."
+    fi
+}
+
+###############################################################################
+# Arch Linux
+###############################################################################
+
+install_arch() {
+    require_command sudo
+    require_command pacman
+    require_command make
+    require_command git
+    require_command gcc
+    require_command pkg-config
+    require_command nproc
+    require_command systemctl
+
+    log "Checking Emacs source tree ($WORKTREE)"
+
+    [[ -d "$SRC_DIR" ]] ||
+        error "Emacs source directory not found: $SRC_DIR"
+
+    [[ -f "$SRC_DIR"/configure.ac ]] ||
+        error "$SRC_DIR does not appear to be an Emacs source tree"
+
+    log "Installing Arch Linux build dependencies"
+
+    sudo pacman -S --needed \
+        base-devel \
+        "${arch_build_dependencies[@]}"
+
+    log "Preparing build"
+
+    if [[ "$CLEAN_BUILD" == true ]]; then
+        if [[ -f "$BUILD_DIR/Makefile" ]]; then
+            log "Performing clean build (make distclean)"
+            make -C "$BUILD_DIR" distclean || true
+        else
+            log "No existing Makefile; skipping distclean"
+        fi
+
+        rm -rf "$BUILD_DIR"
+    fi
+
+    cd "$SRC_DIR"
+
+    log "Running autogen.sh"
+
+    ./autogen.sh
+
+    mkdir -p "$BUILD_DIR"
+    cd "$BUILD_DIR"
+
+    log "Configuring Emacs with PGTK, native compilation, Tree-Sitter, modules, and LTO"
+
+    local flags_c
+    local flags_ld
+
+
+    "$SRC_DIR"/configure \
+        --prefix="/usr/local" \
+        --with-pgtk \
+        --with-native-compilation=aot \
+        --with-tree-sitter \
+        --with-modules \
+        --with-json \
+        --with-gnutls \
+        --with-rsvg \
+        --with-webp \
+        --with-xml2 \
+        --with-imagemagick \
+        --with-cairo \
+        --with-harfbuzz \
+        --with-lcms2 \
+        --with-sqlite3 \
+        --with-mailutils \
+        --with-sound=alsa \
+        --without-compress-install \
+        --enable-link-time-optimization \
+        "CFLAGS=$flags_c" \
+        "LDFLAGS=$flags_ld"
+
+    local jobs
+    jobs="$(nproc)"
+
+    log "Building Emacs using ${jobs} CPU cores with LTO"
+
+    make -j"$jobs"
+
+    log "Installing Emacs"
+
+    sudo make install
+
+    log "Checking local Emacs installation"
+
+    [[ -x "/usr/local/bin/emacs" ]] ||
+        error "Emacs installation failed: /usr/local/bin/emacs not found"
+
+    [[ -x "/usr/local/bin/emacsclient" ]] ||
+        error "Emacs installation failed: /usr/local/bin/emacsclient not found"
+
+    if [[ ":$PATH:" != *"/usr/local/bin:"* ]]; then
+        warn "/usr/local/bin is not currently in PATH"
+    fi
+
+    log "Checking existing systemd user daemon"
+
+    local service_file="$HOME/.config/systemd/user/emacs.service"
+
+    if [[ -f "$service_file" ]]; then
+        log "Existing systemd service found"
+
+        systemctl --user daemon-reload
+        systemctl --user enable --now emacs.service
+
+        log "Verifying systemd service"
+
+        systemctl --user is-active --quiet emacs.service ||
+            error "Emacs systemd service failed to start"
+
+        echo
+        echo "--------------------------------------------------"
+        echo "✅ Arch Linux Emacs build complete ($WORKTREE)"
+        echo "   PGTK + Native Compilation + Tree-Sitter + LTO"
+        echo "   Build:        $BUILD_DIR"
+        echo "   Installation: /usr/local"
+        echo "   Service:      emacs.service"
+        echo "--------------------------------------------------"
+    else
+        warn "No existing $service_file found"
+        warn "Emacs was installed, but no systemd user service was created or started."
+
+        echo
+        echo "--------------------------------------------------"
+        echo "✅ Arch Linux Emacs build complete ($WORKTREE)"
+        echo "   PGTK + Native Compilation + Tree-Sitter + LTO"
+        echo "   Build:        $BUILD_DIR"
+        echo "   Installation: /usr/local"
+        echo "   Service:      not configured"
+        echo "--------------------------------------------------"
+    fi
+}
+
+uninstall_arch() {
+    require_command systemctl
+    require_command pacman
+    require_command sudo
+
+    local service_file="$HOME/.config/systemd/user/emacs.service"
+
+    if [[ -f "$service_file" ]]; then
+        log "Stopping existing Emacs systemd service"
+
+        systemctl --user disable --now emacs.service 2>/dev/null || true
+        systemctl --user daemon-reload
+    else
+        log "No Emacs systemd service file found; skipping service management"
+    fi
+
+    log "Removing build files"
+
+    if [[ -d "$BUILD_DIR" ]]; then
+        rm -rf "$BUILD_DIR"
+    else
+        log "Build directory does not exist; skipping"
+    fi
+
+    log "Removing locally installed Emacs"
+
+    local emacs_files=(
+        /usr/local/bin/emacs
+        /usr/local/bin/emacsclient
+    )
+
+    local existing_files=()
+    local file
+
+    for file in "${emacs_files[@]}"; do
+        if [[ -e "$file" || -L "$file" ]]; then
+            existing_files+=("$file")
+        fi
+    done
+
+    if (( ${#existing_files[@]} > 0 )); then
+        sudo rm -f "${existing_files[@]}"
+    fi
+
+    local orphans=()
+    local current_orphans
+    local pkg
+
+    current_orphans="$(pacman -Qdtq 2>/dev/null || true)"
+
+    for pkg in "${arch_build_dependencies[@]}"; do
+        if echo "$current_orphans" | grep -qxF "$pkg"; then
+            orphans+=("$pkg")
+        fi
+    done
+
+    if (( ${#orphans[@]} > 0 )); then
+        log "Found unused build dependencies safe to remove: ${orphans[*]}"
+
+        read -r -p \
+            "Do you want to uninstall these unused dependencies? [y/N] " \
+            response
+
+        if [[ "$response" =~ ^([yY][eE][sS]|[yY])$ ]]; then
+            sudo pacman -Rns "${orphans[@]}"
+        fi
+    else
+        log "No unused build dependencies found from the target list."
+    fi
+
+    echo "✅ Emacs installation and optional systemd integration removed."
+}
+
+status_arch() {
+    require_command systemctl
+
+    local service_file="$HOME/.config/systemd/user/emacs.service"
+
+    if [[ ! -f "$service_file" ]]; then
+        echo "⚠️  No existing Emacs systemd service file found."
+        echo "   Service management is not configured by this script."
+    elif systemctl --user is-active --quiet emacs.service; then
+        echo "✅ Emacs daemon is running."
+        systemctl --user status --no-pager emacs.service
+    else
+        echo "❌ Emacs daemon is not running."
+        systemctl --user status --no-pager emacs.service || true
+    fi
+
+    echo
+
+    if [[ -x "/usr/local/bin/emacs" ]]; then
+        echo "✅ /usr/local/bin/emacs is installed."
+    else
+        echo "❌ /usr/local/bin/emacs is not installed."
+    fi
+
+    if [[ -x "/usr/local/bin/emacsclient" ]]; then
+        echo "✅ /usr/local/bin/emacsclient is installed."
+    else
+        echo "❌ /usr/local/bin/emacsclient is not installed."
+    fi
+}
+
+###############################################################################
+# Main
+###############################################################################
+
+case "$PLATFORM" in
+    macOS)
+        if [[ "$UNINSTALL" == true ]]; then
+            uninstall_macos
+            uninstall_macos_brew_dependencies
+        elif [[ "$STATUS" == true ]]; then
+            status_macos
+        else
+            install_macos
+        fi
+        ;;
+
+    Linux)
+        if ! command -v pacman >/dev/null 2>&1; then
+            error "This Linux branch currently supports Arch Linux only (pacman not found)."
+        fi
+
+        if [[ "$UNINSTALL" == true ]]; then
+            uninstall_arch
+        elif [[ "$STATUS" == true ]]; then
+            status_arch
+        else
+            install_arch
+        fi
+        ;;
+esac
