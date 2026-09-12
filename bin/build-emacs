@@ -529,19 +529,10 @@ install_arch() {
     fi
 
     cd "$SRC_DIR"
-
-    log "Running autogen.sh"
-
     ./autogen.sh
 
     mkdir -p "$BUILD_DIR"
     cd "$BUILD_DIR"
-
-    log "Configuring Emacs with PGTK, native compilation, Tree-Sitter, modules, and LTO"
-
-    local flags_c
-    local flags_ld
-
 
     "$SRC_DIR"/configure \
         --prefix="/usr/local" \
@@ -563,8 +554,7 @@ install_arch() {
         --with-sound=alsa \
         --without-compress-install \
         --enable-link-time-optimization \
-        "CFLAGS=$flags_c" \
-        "LDFLAGS=$flags_ld"
+
 
     local jobs
     jobs="$(nproc)"
