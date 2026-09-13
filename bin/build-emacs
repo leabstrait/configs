@@ -199,164 +199,205 @@ case "$OS" in
 esac
 
 ###############################################################################
-# macOS
+# macOS (Ruby EmacsBase.rb Converted to Bash)
 ###############################################################################
+
+create_emacs_client_app() {
+    local icons_dir="$1"
+    local prefix_path="$2"
+    local client_app="$BUILD_DIR/nextstep/Emacs Client.app"
+    local client_script="$BUILD_DIR/emacs-client.applescript"
+
+    log "Creating Emacs Client.app"
+
+    local escaped_path="$prefix_path/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+    cat << EOF > "$client_script"
+-- Emacs Client AppleScript Application
+-- Handles opening files from Finder, drag-and-drop, and launching from Spotlight/Dock
+
+on open theDropped
+  repeat with oneDrop in theDropped
+    set dropPath to quoted form of POSIX path of oneDrop
+    try
+      do shell script "PATH='$escaped_path' $prefix_path/bin/emacsclient -c -a '' -n " & dropPath
+    end try
+  end repeat
+  try
+    do shell script "open -a Emacs"
+  end try
+end open
+
+on run
+  try
+    do shell script "PATH='$escaped_path' $prefix_path/bin/emacsclient -c -a '' -n"
+  end try
+  try
+    do shell script "open -a Emacs"
+  end try
+end run
+
+on open location this_URL
+  try
+    do shell script "PATH='$escaped_path' $prefix_path/bin/emacsclient -n " & quoted form of this_URL
+  end try
+  try
+    do shell script "open -a Emacs"
+  end try
+end open location
+EOF
+
+    osacompile -o "$client_app" "$client_script"
+    rm -f "$client_script"
+
+    local client_plist="$client_app/Contents/Info.plist"
+    /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier string org.gnu.EmacsClient" "$client_plist" 2>/dev/null || \
+        /usr/libexec/PlistBuddy -c "Add :CFBundleIdentifier string org.gnu.EmacsClient" "$client_plist"
+
+    /usr/libexec/PlistBuddy -c "Set :CFBundleName string 'Emacs Client'" "$client_plist" 2>/dev/null || \
+        /usr/libexec/PlistBuddy -c "Add :CFBundleName string 'Emacs Client'" "$client_plist"
+
+    /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName string 'Emacs Client'" "$client_plist" 2>/dev/null || \
+        /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string 'Emacs Client'" "$client_plist"
+
+    /usr/libexec/PlistBuddy -c "Set :LSApplicationCategoryType string public.app-category.productivity" "$client_plist" 2>/dev/null || \
+        /usr/libexec/PlistBuddy -c "Add :LSApplicationCategoryType string public.app-category.productivity" "$client_plist"
+
+    # Add Document Types and URL schemes for org-protocol
+    /usr/libexec/PlistBuddy -c 'Delete :CFBundleDocumentTypes' "$client_plist" 2>/dev/null || true
+    /usr/libexec/PlistBuddy -c 'Add :CFBundleDocumentTypes array' "$client_plist"
+    /usr/libexec/PlistBuddy -c 'Add :CFBundleDocumentTypes:0 dict' "$client_plist"
+    /usr/libexec/PlistBuddy -c 'Add :CFBundleDocumentTypes:0:CFBundleTypeRole string Editor' "$client_plist"
+    /usr/libexec/PlistBuddy -c 'Add :CFBundleDocumentTypes:0:CFBundleTypeName string "Text Document"' "$client_plist"
+    /usr/libexec/PlistBuddy -c 'Add :CFBundleDocumentTypes:0:LSItemContentTypes array' "$client_plist"
+    /usr/libexec/PlistBuddy -c 'Add :CFBundleDocumentTypes:0:LSItemContentTypes:0 string public.text' "$client_plist"
+    /usr/libexec/PlistBuddy -c 'Add :CFBundleDocumentTypes:0:LSItemContentTypes:1 string public.plain-text' "$client_plist"
+    /usr/libexec/PlistBuddy -c 'Add :CFBundleDocumentTypes:0:LSItemContentTypes:2 string public.source-code' "$client_plist"
+
+    /usr/libexec/PlistBuddy -c 'Delete :CFBundleURLTypes' "$client_plist" 2>/dev/null || true
+    /usr/libexec/PlistBuddy -c 'Add :CFBundleURLTypes array' "$client_plist"
+    /usr/libexec/PlistBuddy -c 'Add :CFBundleURLTypes:0 dict' "$client_plist"
+    /usr/libexec/PlistBuddy -c 'Add :CFBundleURLTypes:0:CFBundleURLName string "Org Protocol"' "$client_plist"
+    /usr/libexec/PlistBuddy -c 'Add :CFBundleURLTypes:0:CFBundleURLSchemes array' "$client_plist"
+    /usr/libexec/PlistBuddy -c 'Add :CFBundleURLTypes:0:CFBundleURLSchemes:0 string org-protocol' "$client_plist"
+
+    local client_resources_dir="$client_app/Contents/Resources"
+    [[ -f "$icons_dir/Emacs.icns" ]] && cp "$icons_dir/Emacs.icns" "$client_resources_dir/applet.icns"
+    rm -f "$client_resources_dir/droplet.icns" "$client_resources_dir/droplet.rsrc"
+
+    /usr/libexec/PlistBuddy -c 'Delete :CFBundleIconFile' "$client_plist" 2>/dev/null || true
+    /usr/libexec/PlistBuddy -c 'Add :CFBundleIconFile string applet' "$client_plist"
+}
 
 install_macos() {
     log "Checking Emacs source tree ($WORKTREE)"
 
-    [[ -d "$SRC_DIR" ]] ||
-        error "Emacs source directory not found: $SRC_DIR"
-
-    [[ -f "$SRC_DIR"/configure.ac ]] ||
-        error "$SRC_DIR does not appear to be an Emacs source tree"
+    [[ -d "$SRC_DIR" ]] || error "Emacs source directory not found: $SRC_DIR"
+    [[ -f "$SRC_DIR"/configure.ac ]] || error "$SRC_DIR does not appear to be an Emacs source tree"
 
     log "Installing macOS build dependencies"
-
     brew install "${brew_build_dependencies[@]}"
 
     log "Preparing build"
-
     if [[ "$CLEAN_BUILD" == true ]]; then
         if [[ -f "$BUILD_DIR/Makefile" ]]; then
             log "Performing clean build (make distclean)"
-            make -C "$BUILD_DIR" distclean || true
-        else
-            log "No existing Makefile; skipping distclean"
+            gmake -C "$BUILD_DIR" distclean || true
         fi
         rm -rf "$BUILD_DIR"
     fi
 
-    config_args=(
-        --disable-dependency-tracking
-        --disable-silent-rules
-        --enable-locallisppath=#{HOMEBREW_PREFIX}/share/emacs/site-lisp
-        --infodir=#{info}/emacs
-        --prefix=#{prefix}
-        --with-native-compilation=aot
-        --with-xml2
-        --with-gnutls
-        --without-compress-install
-    )
+    local homebrew_prefix
+    homebrew_prefix="$(brew --prefix)"
+    local install_prefix="$HOME/.local"
 
-    # Set flags so Emacs can find Homebrew dependencies on M-series chips
-    CFLAGS="-I/opt/homebrew/include -O3 -march=native" \
-    LDFLAGS="-L/opt/homebrew/lib" \
-    LIBRARY_PATH="/opt/homebrew/lib/gcc/current" \
+    local gcc_ver
+    gcc_ver="$(brew info --json=v2 gcc | jq -r '.formulae[0].installed[0].version' 2>/dev/null || true)"
+    if [[ -z "$gcc_ver" || "$gcc_ver" == "null" ]]; then
+        gcc_ver="$(ls -1 "$homebrew_prefix/lib/gcc" | sort -V | tail -n 1)"
+    fi
+    local gcc_ver_major="${gcc_ver%%.*}"
+    local gcc_lib="$homebrew_prefix/lib/gcc/$gcc_ver_major"
+
+    local sqlite_prefix
+    sqlite_prefix="$(brew --prefix sqlite)"
+    local gcc_prefix
+    gcc_prefix="$(brew --prefix gcc)"
+    local libgccjit_prefix
+    libgccjit_prefix="$(brew --prefix libgccjit)"
+
+    local cflags=()
+    cflags+=("-DFD_SETSIZE=10000")
+    cflags+=("-DDARWIN_UNLIMITED_SELECT")
+    cflags+=("-I$sqlite_prefix/include")
+    cflags+=("-I$gcc_prefix/include")
+    cflags+=("-I$libgccjit_prefix/include")
+
+    local ldflags=()
+    ldflags+=("-L$sqlite_prefix/lib")
+    ldflags+=("-L$gcc_lib")
+    ldflags+=("-Wl,-rpath,$gcc_lib")
+
+    export CFLAGS="${cflags[*]}"
+    export LDFLAGS="${ldflags[*]}"
 
     cd "$SRC_DIR"
+    log "Running autogen.sh"
     ./autogen.sh
 
     mkdir -p "$BUILD_DIR"
     cd "$BUILD_DIR"
 
+    log "Configuring Emacs for macOS"
     "$SRC_DIR"/configure \
+        --prefix="$install_prefix" \
+        --disable-dependency-tracking \
+        --disable-silent-rules \
+        --enable-locallisppath="$homebrew_prefix/share/emacs/site-lisp" \
+        --infodir="$install_prefix/share/info/emacs" \
         --with-ns \
+        --disable-ns-self-contained \
         --with-native-compilation=aot \
         --with-tree-sitter \
         --with-modules \
-        --with-xwidgets
+        --with-xwidgets \
+        --with-gnutls \
+        --with-xml2 \
+        --with-rsvg \
+        --with-webp \
+        --without-imagemagick \
+        --without-pop \
+        --without-compress-install
 
+    log "Building Emacs using $(sysctl -n hw.ncpu) CPU cores"
+    gmake -j"$(sysctl -n hw.ncpu)"
+    gmake install
 
+    # Build Emacs Client.app wrapper via native Bash logic
+    create_emacs_client_app "$BUILD_DIR/nextstep/Emacs.app/Contents/Resources" "$HOME/.local"
 
-    # Build utilizing all CPU cores
-    make -j$(sysctl -n hw.ncpu)
-    make install
+    local app_dir="$BUILD_DIR/nextstep/Emacs.app"
+    local client_app_dir="$BUILD_DIR/nextstep/Emacs Client.app"
 
-exit
-    local app
-    app="$BUILD_DIR/nextstep/Emacs.app"
-
-    [[ -d "$app" ]] ||
-        error "Built Emacs.app not found: $app"
-
-    log "Installing Emacs"
-
-    make install
-
-    [[ -x "/usr/local/bin/emacs" ]] ||
-        error "Emacs installation failed: /usr/local/bin/emacs not found"
-
-    [[ -x "/usr/local/bin/emacsclient" ]] ||
-        error "Emacs installation failed: /usr/local/bin/emacsclient not found"
-
-    if [[ ":$PATH:" != *"/usr/local/bin:"* ]]; then
-        warn "/usr/local/bin is not currently in PATH"
+    if [[ -d "$app_dir" ]]; then
+        log "Re-signing Emacs.app for macOS compatibility..."
+        codesign --force --deep --sign - "$app_dir"
+        rm -rf "$HOME/Applications/Emacs.app"
+        cp -R "$app_dir" "$HOME/Applications/Emacs.app"
     fi
 
-    log "Linking Emacs.app into /Applications"
-
-    if [[ -e /Applications/Emacs.app && ! -L /Applications/Emacs.app ]]; then
-        error "/Applications/Emacs.app exists and is not a symlink; refusing to remove it"
+    if [[ -d "$client_app_dir" ]]; then
+        codesign --force --deep --sign - "$client_app_dir"
+        rm -rf "$HOME/Applications/Emacs Client.app"
+        cp -R "$client_app_dir" "$HOME/Applications/Emacs Client.app"
     fi
-
-    if [[ -L /Applications/Emacs.app ]]; then
-        local current_target
-        current_target="$(readlink /Applications/Emacs.app)"
-
-        if [[ "$current_target" != "$app" ]]; then
-            log "Updating existing Emacs.app symlink"
-            sudo rm /Applications/Emacs.app
-            sudo ln -s "$app" /Applications/Emacs.app
-        else
-            log "Emacs.app symlink already points to current build"
-        fi
-    else
-        sudo ln -s "$app" /Applications/Emacs.app
-    fi
-
-    log "Configuring launchd daemon"
-
-    local plist_dir="$HOME/Library/LaunchAgents"
-    local plist_file="$plist_dir/org.gnu.Emacs.plist"
-    local uid
-
-    uid="$(id -u)"
-
-    mkdir -p "$plist_dir"
-
-    cat > "$plist_file" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-"http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>org.gnu.Emacs</string>
-
-    <key>ProgramArguments</key>
-    <array>
-        <string>/Applications/Emacs.app/Contents/MacOS/Emacs</string>
-        <string>--fg-daemon</string>
-    </array>
-
-    <key>RunAtLoad</key>
-    <true/>
-
-    <key>KeepAlive</key>
-    <true/>
-</dict>
-</plist>
-EOF
-
-    log "Reloading launchd service"
-
-    launchctl bootout "gui/$uid" "$plist_file" 2>/dev/null || true
-    launchctl bootstrap "gui/$uid" "$plist_file"
-
-    log "Verifying launchd service"
-
-    launchctl print "gui/$uid/org.gnu.Emacs" >/dev/null ||
-        error "Emacs launchd service failed to start"
 
     echo
     echo "--------------------------------------------------"
     echo "✅ macOS Emacs build complete ($WORKTREE)"
-    echo "   Cocoa + Native Compilation + Tree-Sitter + LTO"
+    echo "   Cocoa + Native Compilation + Tree-Sitter"
     echo "   Build:        $BUILD_DIR"
-    echo "   Application:  /Applications/Emacs.app"
-    echo "   App target:   $app"
-    echo "   Daemon:       org.gnu.Emacs"
+    echo "   Application:  $HOME/Applications/Emacs.app"
     echo "--------------------------------------------------"
 }
 
@@ -365,35 +406,22 @@ uninstall_macos() {
 
     local plist_file="$HOME/Library/LaunchAgents/org.gnu.Emacs.plist"
     local uid
-
     uid="$(id -u)"
 
     log "Stopping launchd daemon"
-
     if [[ -f "$plist_file" ]]; then
         launchctl bootout "gui/$uid" "$plist_file" 2>/dev/null || true
         rm -f "$plist_file"
     fi
 
-    if [[ -L /Applications/Emacs.app ]]; then
-        local target
-        target="$(readlink /Applications/Emacs.app)"
-
-        log "Removing /Applications/Emacs.app symlink"
-        sudo rm /Applications/Emacs.app
-
-        echo "Removed symlink:"
-        echo "  /Applications/Emacs.app -> $target"
-    elif [[ -e /Applications/Emacs.app ]]; then
-        warn "/Applications/Emacs.app exists and is not a symlink; leaving it untouched"
+    if [[ -d "$HOME/Applications/Emacs.app" ]]; then
+        log "Removing $HOME/Applications/Emacs.app"
+        rm -rf "$HOME/Applications/Emacs.app"
     fi
 
-    if [[ -x "/usr/local/bin/emacs" ]]; then
-        log "Removing /usr/local/bin/emacs installation"
-
-        sudo rm -f \
-            /usr/local/bin/emacs \
-            /usr/local/bin/emacsclient
+    if [[ -d "$HOME/Applications/Emacs Client.app" ]]; then
+        log "Removing $HOME/Applications/Emacs Client.app"
+        rm -rf "$HOME/Applications/Emacs Client.app"
     fi
 
     echo "✅ macOS Emacs daemon/service integration removed."
@@ -421,7 +449,6 @@ uninstall_macos_brew_dependencies() {
 
     while IFS= read -r formula; do
         [[ -n "$formula" ]] || continue
-
         for package in "${installed[@]}"; do
             if [[ "$formula" == "$package" ]]; then
                 leaves+=("$formula")
@@ -436,11 +463,7 @@ uninstall_macos_brew_dependencies() {
     fi
 
     log "Found unused Homebrew build dependencies: ${leaves[*]}"
-
-    read -r -p \
-        "Do you want to uninstall these unused dependencies? [y/N] " \
-        response
-
+    read -r -p "Do you want to uninstall these unused dependencies? [y/N] " response
     if [[ "$response" =~ ^([yY][eE][sS]|[yY])$ ]]; then
         brew uninstall "${leaves[@]}"
     else
@@ -463,27 +486,10 @@ status_macos() {
 
     echo
 
-    if [[ -L /Applications/Emacs.app ]]; then
-        echo "Application symlink:"
-        echo "  /Applications/Emacs.app -> $(readlink /Applications/Emacs.app)"
-    elif [[ -e /Applications/Emacs.app ]]; then
-        echo "⚠️  /Applications/Emacs.app exists but is not a symlink."
+    if [[ -d "$HOME/Applications/Emacs.app" ]]; then
+        echo "✅ $HOME/Applications/Emacs.app exists."
     else
-        echo "❌ /Applications/Emacs.app symlink does not exist."
-    fi
-
-    echo
-
-    if [[ -x "/usr/local/bin/emacs" ]]; then
-        echo "✅ /usr/local/bin/emacs is installed."
-    else
-        echo "❌ /usr/local/bin/emacs is not installed."
-    fi
-
-    if [[ -x "/usr/local/bin/emacsclient" ]]; then
-        echo "✅ /usr/local/bin/emacsclient is installed."
-    else
-        echo "❌ /usr/local/bin/emacsclient is not installed."
+        echo "❌ $HOME/Applications/Emacs.app does not exist."
     fi
 }
 
@@ -503,28 +509,20 @@ install_arch() {
 
     log "Checking Emacs source tree ($WORKTREE)"
 
-    [[ -d "$SRC_DIR" ]] ||
-        error "Emacs source directory not found: $SRC_DIR"
-
-    [[ -f "$SRC_DIR"/configure.ac ]] ||
-        error "$SRC_DIR does not appear to be an Emacs source tree"
+    [[ -d "$SRC_DIR" ]] || error "Emacs source directory not found: $SRC_DIR"
+    [[ -f "$SRC_DIR"/configure.ac ]] || error "$SRC_DIR does not appear to be an Emacs source tree"
 
     log "Installing Arch Linux build dependencies"
-
     sudo pacman -S --needed \
         base-devel \
         "${arch_build_dependencies[@]}"
 
     log "Preparing build"
-
     if [[ "$CLEAN_BUILD" == true ]]; then
         if [[ -f "$BUILD_DIR/Makefile" ]]; then
             log "Performing clean build (make distclean)"
             make -C "$BUILD_DIR" distclean || true
-        else
-            log "No existing Makefile; skipping distclean"
         fi
-
         rm -rf "$BUILD_DIR"
     fi
 
@@ -560,39 +558,28 @@ install_arch() {
     jobs="$(nproc)"
 
     log "Building Emacs using ${jobs} CPU cores with LTO"
-
     make -j"$jobs"
 
     log "Installing Emacs"
-
     sudo make install
 
-    log "Checking local Emacs installation"
-
-    [[ -x "/usr/local/bin/emacs" ]] ||
-        error "Emacs installation failed: /usr/local/bin/emacs not found"
-
-    [[ -x "/usr/local/bin/emacsclient" ]] ||
-        error "Emacs installation failed: /usr/local/bin/emacsclient not found"
+    [[ -x "/usr/local/bin/emacs" ]] || error "Emacs installation failed: /usr/local/bin/emacs not found"
+    [[ -x "/usr/local/bin/emacsclient" ]] || error "Emacs installation failed: /usr/local/bin/emacsclient not found"
 
     if [[ ":$PATH:" != *"/usr/local/bin:"* ]]; then
         warn "/usr/local/bin is not currently in PATH"
     fi
 
     log "Checking existing systemd user daemon"
-
     local service_file="$HOME/.config/systemd/user/emacs.service"
 
     if [[ -f "$service_file" ]]; then
         log "Existing systemd service found"
-
         systemctl --user daemon-reload
         systemctl --user enable --now emacs.service
 
         log "Verifying systemd service"
-
-        systemctl --user is-active --quiet emacs.service ||
-            error "Emacs systemd service failed to start"
+        systemctl --user is-active --quiet emacs.service || error "Emacs systemd service failed to start"
 
         echo
         echo "--------------------------------------------------"
@@ -604,8 +591,6 @@ install_arch() {
         echo "--------------------------------------------------"
     else
         warn "No existing $service_file found"
-        warn "Emacs was installed, but no systemd user service was created or started."
-
         echo
         echo "--------------------------------------------------"
         echo "✅ Arch Linux Emacs build complete ($WORKTREE)"
@@ -626,7 +611,6 @@ uninstall_arch() {
 
     if [[ -f "$service_file" ]]; then
         log "Stopping existing Emacs systemd service"
-
         systemctl --user disable --now emacs.service 2>/dev/null || true
         systemctl --user daemon-reload
     else
@@ -634,20 +618,15 @@ uninstall_arch() {
     fi
 
     log "Removing build files"
-
     if [[ -d "$BUILD_DIR" ]]; then
         rm -rf "$BUILD_DIR"
-    else
-        log "Build directory does not exist; skipping"
     fi
 
     log "Removing locally installed Emacs"
-
     local emacs_files=(
         /usr/local/bin/emacs
         /usr/local/bin/emacsclient
     )
-
     local existing_files=()
     local file
 
@@ -697,7 +676,6 @@ status_arch() {
 
     if [[ ! -f "$service_file" ]]; then
         echo "⚠️  No existing Emacs systemd service file found."
-        echo "   Service management is not configured by this script."
     elif systemctl --user is-active --quiet emacs.service; then
         echo "✅ Emacs daemon is running."
         systemctl --user status --no-pager emacs.service
